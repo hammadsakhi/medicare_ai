@@ -424,7 +424,8 @@ supabase_user_id = current_user["id"]
 # 7. GROQ MODEL
 # =========================================================
 
-api_key = os.getenv("GROQ_API_KEY")
+from config import get_setting
+api_key = get_setting("GROQ_API_KEY")
 model_name = os.getenv(
     "GROQ_MODEL",
     "llama-3.3-70b-versatile",

@@ -4,6 +4,7 @@ import os
 import streamlit as st
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from config import get_setting
 
 load_dotenv()
 
@@ -12,8 +13,8 @@ def get_supabase_client() -> Client:
     """Return a Supabase client isolated to this Streamlit session."""
 
     if "_supabase_client" not in st.session_state:
-        supabase_url = os.getenv("SUPABASE_URL")
-        supabase_key = os.getenv("SUPABASE_KEY")
+        supabase_url = get_setting("SUPABASE_URL")
+        supabase_key = get_setting("SUPABASE_KEY")
 
         if not supabase_url or not supabase_key:
             raise RuntimeError(

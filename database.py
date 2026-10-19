@@ -25,7 +25,9 @@ from sqlalchemy.orm import (
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+from config import get_setting
+
+DATABASE_URL = get_setting("DATABASE_URL")
 
 if not DATABASE_URL:
     raise RuntimeError(
