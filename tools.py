@@ -12,6 +12,17 @@ from database import SessionLocal, Doctor, Appointment
 # 1. VALIDATION HELPERS
 # =========================================================
 
+WEEKDAYS = {
+    "mon": 0, "monday": 0,
+    "tue": 1, "tues": 1, "tuesday": 1,
+    "wed": 2, "wednesday": 2,
+    "thu": 3, "thur": 3, "thurs": 3, "thursday": 3,
+    "fri": 4, "friday": 4,
+    "sat": 5, "saturday": 5,
+    "sun": 6, "sunday": 6,
+}
+
+
 def parse_date(value: str) -> date:
     """Validate an appointment date."""
     try:
@@ -30,30 +41,24 @@ def parse_time(value: str) -> time:
     try:
         requested_time = time.fromisoformat(value)
     except (TypeError, ValueError):
-        raise ValueError(
-            "Use the time format HH:MM, such as 10:30."
-        )
+        raise ValueError("Use the time format HH:MM, such as 10:30.")
 
     if requested_time.tzinfo is not None:
         raise ValueError("Use local clinic time without a timezone.")
 
-    if requested_time.second != 0 or requested_time.microsecond != 0:
+    if requested_time.second or requested_time.microsecond:
         raise ValueError("Choose a time in HH:MM format.")
 
     if requested_time.minute not in (0, 30):
-        raise ValueError(
-            "Choose a slot starting on the hour or half-hour."
-        )
+        raise ValueError("Choose a slot starting on the hour or half-hour.")
 
     return requested_time
 
 
 def require_user_id(supabase_user_id: str | None) -> str:
-    """Require an authenticated Supabase user ID."""
+    """Require an authenticated user ID."""
     if not isinstance(supabase_user_id, str) or not supabase_user_id.strip():
-        raise ValueError(
-            "You must be logged in to manage appointments."
-        )
+        raise ValueError("You must be logged in to manage appointments.")
 
     return supabase_user_id.strip()
 
@@ -75,16 +80,94 @@ def get_doctor(session, doctor_id: str):
 
 
 def is_working_day(doctor, requested_date: date) -> bool:
-    """Check whether the doctor works on the requested weekday."""
-    weekday = requested_date.weekday()
+    """
+    Support schedules such as:
+    Mon-Fri, Monday-Friday, Mon-Sat,
+    Mon,Tue,Wed,Thu,Fri, or Daily.
 
-    if doctor.working_days == "Mon-Fri":
-        return weekday < 5
+    Unknown schedule formats are rejected.
+    """
+    raw_days = str(getattr(doctor, "working_days", "") or "").strip().lower()
 
-    if doctor.working_days == "Mon-Sat":
-        return weekday < 6
+    if not raw_days:
+        return False
 
-    return True
+    normalized = (
+        raw_days.replace(" ", "")
+        .replace("–", "-")
+        .replace("—", "-")
+        .replace(".", "")
+    )
+
+    if normalized in {
+        "daily", "everyday", "allweek",
+        "mon-sun", "monday-sunday",
+    }:
+        return True
+
+    # Weekday ranges, such as Mon-Fri.
+    if "-" in normalized and "," not in normalized:
+        parts = normalized.split("-", 1)
+
+        if len(parts) != 2:
+            return False
+
+        start_name, end_name = parts
+
+        if start_name not in WEEKDAYS or end_name not in WEEKDAYS:
+            return False
+
+        start_day = WEEKDAYS[start_name]
+        end_day = WEEKDAYS[end_name]
+        day = requested_date.weekday()
+
+        if start_day <= end_day:
+            return start_day <= day <= end_day
+
+        # Supports a range crossing Sunday, such as Fri-Mon.
+        return day >= start_day or day <= end_day
+
+    # Comma-separated days, such as Mon,Tue,Wed,Thu,Fri.
+    parts = normalized.split(",")
+
+    if not parts or any(part not in WEEKDAYS for part in parts):
+        return False
+
+    allowed_days = {WEEKDAYS[part] for part in parts}
+
+    return requested_date.weekday() in allowed_days
+
+
+def validate_doctor_slot(doctor, requested_date: date, requested_time: time):
+    """Reject appointments outside the doctor's schedule."""
+    if not is_working_day(doctor, requested_date):
+        schedule = doctor.working_days or "not configured"
+
+        raise ValueError(
+            f"{doctor.name} does not work on "
+            f"{requested_date.strftime('%A, %d %B %Y')}. "
+            f"Recorded working days: {schedule}."
+        )
+
+    if not doctor.start_time <= requested_time < doctor.end_time:
+        raise ValueError(
+            f"The requested time is outside {doctor.name}'s clinic hours "
+            f"({doctor.start_time.strftime('%H:%M')}-"
+            f"{doctor.end_time.strftime('%H:%M')})."
+        )
+
+
+def get_booked_times(session, doctor_id: str, requested_date: date) -> set:
+    """Get confirmed appointment times for a doctor on a given date."""
+    return set(
+        session.scalars(
+            select(Appointment.appointment_time).where(
+                Appointment.doctor_id == doctor_id,
+                Appointment.appointment_date == requested_date,
+                Appointment.status == "confirmed",
+            )
+        ).all()
+    )
 
 
 # =========================================================
@@ -93,8 +176,7 @@ def is_working_day(doctor, requested_date: date) -> bool:
 
 @tool
 def list_doctors(specialty: str = "") -> dict:
-    """List doctors, their IDs, specialties, working days,
-    and clinic hours. Optionally filter by specialty."""
+    """List doctors, specialties, working days, and clinic hours."""
     with SessionLocal() as session:
         query = select(Doctor).order_by(Doctor.name)
 
@@ -121,7 +203,7 @@ def list_doctors(specialty: str = "") -> dict:
 
 
 # =========================================================
-# 3. AVAILABILITY
+# 3. CHECK AVAILABILITY
 # =========================================================
 
 @tool
@@ -129,7 +211,7 @@ def check_doctor_availability(
     doctor_id: str,
     appointment_date: str,
 ) -> dict:
-    """Check available 30-minute appointment slots.
+    """Check available 30-minute slots for a doctor.
     Date format: YYYY-MM-DD."""
     requested_date = parse_date(appointment_date)
     now = datetime.now()
@@ -137,34 +219,33 @@ def check_doctor_availability(
     with SessionLocal() as session:
         doctor = get_doctor(session, doctor_id)
 
+        date_display = requested_date.strftime("%d %B %Y (%A)")
+
         if not is_working_day(doctor, requested_date):
             return {
+                "success": True,
                 "doctor_id": doctor.doctor_id,
                 "doctor": doctor.name,
                 "date": requested_date.isoformat(),
+                "date_display": date_display,
                 "available_slots": [],
-                "message": "The doctor does not work on this day.",
+                "message": (
+                    f"{doctor.name} does not work on "
+                    f"{requested_date.strftime('%A')}. "
+                    f"Working days: {doctor.working_days or 'not configured'}."
+                ),
             }
 
-        booked_times = set(
-            session.scalars(
-                select(Appointment.appointment_time).where(
-                    Appointment.doctor_id == doctor.doctor_id,
-                    Appointment.appointment_date == requested_date,
-                    Appointment.status == "confirmed",
-                )
-            ).all()
+        booked_times = get_booked_times(
+            session, doctor.doctor_id, requested_date
         )
 
         available_slots = []
-        current = datetime.combine(
-            requested_date, doctor.start_time
-        )
-        finish = datetime.combine(
-            requested_date, doctor.end_time
-        )
+        current = datetime.combine(requested_date, doctor.start_time)
+        finish = datetime.combine(requested_date, doctor.end_time)
 
-        while current < finish:
+        # Only offer slots that can fit a full 30-minute appointment.
+        while current + timedelta(minutes=30) <= finish:
             slot_time = current.time()
 
             if requested_date == now.date() and current <= now:
@@ -177,10 +258,13 @@ def check_doctor_availability(
             current += timedelta(minutes=30)
 
         return {
+            "success": True,
             "doctor_id": doctor.doctor_id,
             "doctor": doctor.name,
             "specialty": doctor.specialty,
             "date": requested_date.isoformat(),
+            "date_display": date_display,
+            "working_days": doctor.working_days,
             "working_hours": (
                 f"{doctor.start_time.strftime('%H:%M')} - "
                 f"{doctor.end_time.strftime('%H:%M')}"
@@ -208,17 +292,15 @@ def book_appointment(
     reason: str = "",
     supabase_user_id: str = "",
 ) -> dict:
-    """Book an appointment after the patient confirms its details.
-    Requires patient name, phone, doctor ID, date YYYY-MM-DD,
-    time HH:MM, and the authenticated user ID supplied by the app.
-    Always check availability before booking."""
+    """Book an appointment after patient confirmation.
+    Revalidates the doctor's working day, clinic hours, date, time,
+    and slot availability before saving."""
     owner_id = require_user_id(supabase_user_id)
-
     requested_date = parse_date(appointment_date)
     requested_time = parse_time(appointment_time)
 
-    # Reject appointments whose time has already passed today.
     now = datetime.now()
+
     if (
         requested_date == now.date()
         and requested_time <= now.time().replace(tzinfo=None)
@@ -233,17 +315,16 @@ def book_appointment(
 
     patient_name = patient_name.strip()
 
-    if len(patient_name) < 2:
-        raise ValueError("Please provide the patient's full name.")
-
-    if len(patient_name) > 100:
-        raise ValueError("Patient name must be 100 characters or fewer.")
+    if not 2 <= len(patient_name) <= 100:
+        raise ValueError(
+            "Patient name must be between 2 and 100 characters."
+        )
 
     if not isinstance(phone, str):
         raise ValueError("Please provide a valid contact phone number.")
 
     phone = phone.strip()
-    digits = "".join(character for character in phone if character.isdigit())
+    digits = "".join(char for char in phone if char.isdigit())
 
     if not 7 <= len(digits) <= 15:
         raise ValueError("Please provide a valid contact phone number.")
@@ -253,13 +334,18 @@ def book_appointment(
     with SessionLocal() as session:
         doctor = get_doctor(session, doctor_id)
 
-        if not is_working_day(doctor, requested_date):
-            raise ValueError("The doctor does not work on that day.")
+        # Validate the authoritative schedule before creating a record.
+        validate_doctor_slot(doctor, requested_date, requested_time)
 
-        if not (
-            doctor.start_time <= requested_time < doctor.end_time
-        ):
-            raise ValueError("The requested time is outside clinic hours.")
+        booked_times = get_booked_times(
+            session, doctor.doctor_id, requested_date
+        )
+
+        if requested_time in booked_times:
+            raise ValueError(
+                "That slot is already booked. "
+                "Please check availability again."
+            )
 
         appointment = Appointment(
             patient_name=patient_name,
@@ -280,8 +366,8 @@ def book_appointment(
         except IntegrityError:
             session.rollback()
             raise ValueError(
-                "That slot is already booked. "
-                "Please check availability again."
+                "That slot is already booked or conflicts with a database "
+                "constraint. Please check availability again."
             )
 
         return {
@@ -292,7 +378,10 @@ def book_appointment(
             "doctor": doctor.name,
             "specialty": doctor.specialty,
             "date": requested_date.isoformat(),
+            # Python computes the correct weekday from the actual date.
+            "date_display": requested_date.strftime("%d %B %Y (%A)"),
             "time": requested_time.strftime("%H:%M"),
+            "working_days": doctor.working_days,
             "message": "Appointment saved successfully.",
         }
 
@@ -307,9 +396,7 @@ def find_appointment(
     patient_phone: str,
     supabase_user_id: str = "",
 ) -> dict:
-    """Find an appointment belonging to the authenticated user,
-    matching its booking ID and booking phone number.
-    The app supplies the authenticated user ID."""
+    """Find an appointment belonging to the authenticated user."""
     owner_id = require_user_id(supabase_user_id)
 
     with SessionLocal() as session:
@@ -332,6 +419,7 @@ def find_appointment(
             }
 
         appointment, doctor = result
+        appointment_date = appointment.appointment_date
 
         return {
             "found": True,
@@ -340,7 +428,10 @@ def find_appointment(
                 "patient_name": appointment.patient_name,
                 "doctor": doctor.name,
                 "specialty": doctor.specialty,
-                "date": appointment.appointment_date.isoformat(),
+                "date": appointment_date.isoformat(),
+                "date_display": appointment_date.strftime(
+                    "%d %B %Y (%A)"
+                ),
                 "time": appointment.appointment_time.strftime("%H:%M"),
                 "status": appointment.status,
                 "reason": appointment.reason,
@@ -358,9 +449,7 @@ def cancel_appointment(
     patient_phone: str,
     supabase_user_id: str = "",
 ) -> dict:
-    """Cancel a confirmed appointment belonging to the authenticated
-    user. Match the booking ID and phone number. The app supplies
-    the authenticated user ID."""
+    """Cancel a confirmed appointment belonging to the authenticated user."""
     owner_id = require_user_id(supabase_user_id)
 
     with SessionLocal() as session:
@@ -376,9 +465,7 @@ def cancel_appointment(
         if appointment is None:
             return {
                 "success": False,
-                "message": (
-                    "No matching confirmed appointment was found."
-                ),
+                "message": "No matching confirmed appointment was found.",
             }
 
         appointment.status = "cancelled"
@@ -410,10 +497,7 @@ def execute_tool(
     args: dict,
     supabase_user_id: str | None = None,
 ):
-    """Execute a registered tool and inject trusted account identity.
-
-    Never trust an account ID generated by the language model.
-    """
+    """Execute an allowed tool and inject trusted account identity."""
     allowed_tools = {item.name: item for item in TOOL_LIST}
 
     if name not in allowed_tools:
@@ -426,9 +510,8 @@ def execute_tool(
         "find_appointment",
         "cancel_appointment",
     }:
-        owner_id = require_user_id(supabase_user_id)
-
-        # Override any value the model may have supplied.
-        safe_args["supabase_user_id"] = owner_id
+        safe_args["supabase_user_id"] = require_user_id(
+            supabase_user_id
+        )
 
     return allowed_tools[name].invoke(safe_args)

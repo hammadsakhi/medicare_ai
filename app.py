@@ -2,6 +2,8 @@
 import json
 import os
 import re
+from datetime import date, datetime
+from html import escape
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -20,6 +22,7 @@ from auth_service import (
     logout_user,
     restore_login,
 )
+from config import get_setting
 from database import init_db
 from tools import (
     TOOL_LIST,
@@ -60,7 +63,10 @@ def setup_database():
 try:
     setup_database()
 except Exception as error:
-    st.error("Unable to initialize PostgreSQL. Check DATABASE_URL and database models.")
+    st.error(
+        "Unable to initialize PostgreSQL. "
+        "Check DATABASE_URL and your database configuration."
+    )
     with st.expander("Technical details"):
         st.code(str(error))
     st.stop()
@@ -82,7 +88,6 @@ if not st.session_state.get("authenticated_user"):
         st.info("Loading your saved session...")
         st.stop()
 
-    # Read the saved token on every run when not logged in.
     saved_token = (
         cookies.get(COOKIE_NAME)
         if isinstance(cookies, dict)
@@ -94,8 +99,11 @@ if not st.session_state.get("authenticated_user"):
             restored = restore_login(saved_token)
 
             if not restored:
-                # Remove an expired, revoked, or invalid cookie.
-                cookie_controller.remove(COOKIE_NAME)
+                try:
+                    cookie_controller.remove(COOKIE_NAME)
+                except Exception as cookie_error:
+                    print(f"Cookie removal error: {cookie_error}")
+
                 st.warning(
                     "Your saved session is no longer valid. "
                     "Please log in again."
@@ -103,7 +111,11 @@ if not st.session_state.get("authenticated_user"):
 
         except Exception as error:
             print(f"Session restoration error: {error}")
-            st.error("Unable to restore your saved session.")
+            st.error(
+                "Unable to restore your saved session. "
+                "Please try logging in again."
+            )
+
 
 # =========================================================
 # 4. STYLING
@@ -296,7 +308,9 @@ if not st.session_state.get("authenticated_user"):
     )
 
     st.markdown("### Welcome")
-    st.write("Log in or create an account to access your appointment assistant.")
+    st.write(
+        "Log in or create an account to access your appointment assistant."
+    )
 
     login_tab, register_tab = st.tabs(
         ["Log in", "Create account"]
@@ -319,41 +333,62 @@ if not st.session_state.get("authenticated_user"):
             )
 
         if login_submitted:
-            result = login_user(login_email, login_password)
+            try:
+                result = login_user(
+                    login_email,
+                    login_password,
+                )
 
-            if not result.get("success"):
-                st.error(result.get("message", "Unable to log in."))
-
-            else:
-                token = result.get("session_token")
-                user = result.get("user")
-
-                if not token or not user:
-                    st.error("Login succeeded, but no saved session was returned.")
+                if not result.get("success"):
+                    st.error(
+                        result.get("message", "Unable to log in.")
+                    )
 
                 else:
-                    try:
-                        # Save the token in the browser.
-                        cookie_controller.set(
-                            COOKIE_NAME,
-                            token,
-                            max_age=SESSION_MAX_AGE,
+                    token = result.get("session_token")
+                    user = result.get("user")
+
+                    if not token or not user:
+                        st.error(
+                            "Login succeeded, but no saved session was returned."
                         )
 
-                        # Set the current Streamlit login.
-                        st.session_state["authenticated_user"] = user
-                        st.session_state["session_token"] = token
-                        st.session_state["cookie_checked"] = True
+                    else:
+                        try:
+                            cookie_controller.set(
+                                COOKIE_NAME,
+                                token,
+                                max_age=SESSION_MAX_AGE,
+                            )
 
-                        # Continue into the authenticated page below.
-                        # Avoid an immediate rerun that might happen
-                        # before the browser has processed the cookie.
-                        st.success("Login successful.")
+                            st.session_state["authenticated_user"] = user
+                            st.session_state["session_token"] = token
+                            st.session_state["cookie_checked"] = True
 
-                    except Exception as error:
-                        print(f"Cookie save error: {error}")
-                        logout_user(token)
-                        st.error("Could not save your login in the browser.")
+                            st.success("Login successful.")
+                            st.rerun()
+
+                        except Exception as error:
+                            print(f"Cookie save error: {error}")
+
+                            try:
+                                logout_user(token)
+                            except Exception as logout_error:
+                                print(
+                                    "Session cleanup error: "
+                                    f"{logout_error}"
+                                )
+
+                            st.error(
+                                "Could not save your login in the browser. "
+                                "Please try again."
+                            )
+
+            except Exception as error:
+                print(f"Login error: {error}")
+                st.error(
+                    "Login could not be completed. Please try again."
+                )
 
     with register_tab:
         with st.form("register_form"):
@@ -381,27 +416,40 @@ if not st.session_state.get("authenticated_user"):
             )
 
         if register_submitted:
-            result = register_user(
-                register_name,
-                register_email,
-                register_password,
-                register_confirm,
-            )
+            try:
+                result = register_user(
+                    register_name,
+                    register_email,
+                    register_password,
+                    register_confirm,
+                )
 
-            if result.get("success"):
-                st.success(result.get("message", "Account created."))
+                if result.get("success"):
+                    st.success(
+                        result.get("message", "Account created.")
+                    )
 
-                if result.get("verified"):
-                    st.info("You can now log in.")
-            else:
-                st.error(result.get("message", "Unable to create account."))
+                    if result.get("verified"):
+                        st.info("You can now log in.")
+                else:
+                    st.error(
+                        result.get(
+                            "message",
+                            "Unable to create account.",
+                        )
+                    )
+
+            except Exception as error:
+                print(f"Registration error: {error}")
+                st.error(
+                    "Registration could not be completed. Please try again."
+                )
 
     st.caption(
         "Portfolio demonstration using fictional doctors. "
         "Do not enter sensitive medical information."
     )
 
-    # Stop only if login did not succeed during this run.
     if not st.session_state.get("authenticated_user"):
         st.stop()
 
@@ -424,7 +472,6 @@ supabase_user_id = current_user["id"]
 # 7. GROQ MODEL
 # =========================================================
 
-from config import get_setting
 api_key = get_setting("GROQ_API_KEY")
 model_name = os.getenv(
     "GROQ_MODEL",
@@ -470,21 +517,148 @@ if "cancel_flow" not in st.session_state:
 
 
 def add_message(role, content):
-    """Save and display a chat message."""
+    """Save a message and display it."""
     st.session_state.messages.append(
         {"role": role, "content": content}
     )
+
     with st.chat_message(role):
         st.markdown(content)
 
 
 def normalize_confirmation(value):
-    """Normalize confirmation text."""
+    """Normalize confirmation text for comparison."""
     return re.sub(
         r"[^a-z0-9 ]",
         "",
         value.lower(),
     ).strip()
+
+
+def is_booking_tool(tool_name):
+    """Identify the appointment-booking tool by its name."""
+    normalized = re.sub(
+        r"[^a-z0-9]",
+        "",
+        str(tool_name).lower(),
+    )
+
+    return normalized in {
+        "bookappointment",
+        "bookappointmenttool",
+        "createappointment",
+    }
+
+
+def get_result_value(result, *keys, default="Not provided"):
+    """Return the first available non-empty field from a tool result."""
+    for key in keys:
+        value = result.get(key)
+
+        if value is not None and str(value).strip():
+            return value
+
+    appointment = result.get("appointment")
+
+    if isinstance(appointment, dict):
+        for key in keys:
+            value = appointment.get(key)
+
+            if value is not None and str(value).strip():
+                return value
+
+    return default
+
+
+def authoritative_date_display(result):
+    """
+    Prefer the date display returned by the booking tool.
+    If absent, calculate the weekday using Python, not the AI model.
+    """
+    display = get_result_value(
+        result,
+        "date_display",
+        "formatted_date",
+        default="",
+    )
+
+    if display:
+        return str(display)
+
+    raw_date = get_result_value(
+        result,
+        "date",
+        "appointment_date",
+        "requested_date",
+        default="",
+    )
+
+    if isinstance(raw_date, datetime):
+        raw_date = raw_date.date()
+
+    if isinstance(raw_date, date):
+        parsed_date = raw_date
+    else:
+        try:
+            parsed_date = date.fromisoformat(
+                str(raw_date).strip()[:10]
+            )
+        except (ValueError, TypeError):
+            return str(raw_date or "Not provided")
+
+    return parsed_date.strftime("%d %B %Y (%A)")
+
+
+def format_booking_success(result):
+    """Create a deterministic confirmation from the actual tool result."""
+    booking_id = get_result_value(
+        result,
+        "appointment_id",
+        "booking_id",
+        "id",
+    )
+    patient_name = get_result_value(
+        result,
+        "patient_name",
+        "name",
+    )
+    doctor_name = get_result_value(
+        result,
+        "doctor",
+        "doctor_name",
+    )
+    date_display = authoritative_date_display(result)
+    appointment_time = get_result_value(
+        result,
+        "time",
+        "appointment_time",
+    )
+
+    return (
+        "✅ **Appointment booked successfully!**\n\n"
+        "Your booking was saved by the appointment system.\n\n"
+        f"- **Booking ID:** {booking_id}\n"
+        f"- **Patient:** {patient_name}\n"
+        f"- **Doctor:** {doctor_name}\n"
+        f"- **Date:** {date_display}\n"
+        f"- **Time:** {appointment_time}\n"
+        "- **Status:** Confirmed\n\n"
+        "Please keep your booking ID for future lookup or cancellation."
+    )
+
+
+def format_booking_failure(result):
+    """Report a booking failure without claiming success."""
+    message = result.get(
+        "message",
+        "The appointment system could not complete the booking.",
+    )
+
+    return (
+        "⚠️ **The appointment was not confirmed.**\n\n"
+        f"{message}\n\n"
+        "Please check the details or choose another available slot."
+    )
 
 
 # =========================================================
@@ -497,8 +671,10 @@ with st.sidebar:
     st.divider()
 
     st.markdown("### Account")
-    st.markdown(f"**{current_user.get('name', 'Patient')}**")
-    st.caption(current_user.get("email", ""))
+    st.markdown(
+        f"**{escape(str(current_user.get('name', 'Patient')))}**"
+    )
+    st.caption(str(current_user.get("email", "")))
 
     if st.button("Log out", use_container_width=True):
         token = st.session_state.get("session_token")
@@ -507,7 +683,10 @@ with st.sidebar:
             logout_user(token)
         except Exception as error:
             print(f"Logout error: {error}")
-            st.error("The server session could not be revoked.")
+            st.error(
+                "The server session could not be revoked. "
+                "Please try again."
+            )
             st.stop()
 
         try:
@@ -520,10 +699,10 @@ with st.sidebar:
             "session_token",
             "messages",
             "cancel_flow",
+            "cookie_checked",
         ):
             st.session_state.pop(key, None)
 
-        st.session_state["cookie_checked"] = False
         st.rerun()
 
     st.divider()
@@ -549,7 +728,8 @@ with st.sidebar:
                 st.markdown(f"**{doctor['name']}**")
                 st.caption(doctor["specialty"])
                 st.markdown(
-                    f"`{doctor['doctor_id']}` · {doctor['working_days']}"
+                    f"`{doctor['doctor_id']}` · "
+                    f"{doctor['working_days']}"
                 )
                 st.caption(
                     f"{doctor['start_time']} – {doctor['end_time']}"
@@ -656,7 +836,8 @@ if user_text:
         st.session_state.cancel_flow = None
         add_message(
             "assistant",
-            "Cancellation request stopped. Your appointment has not been cancelled.",
+            "Cancellation request stopped. "
+            "Your appointment has not been cancelled.",
         )
         st.stop()
 
@@ -671,7 +852,8 @@ if user_text:
             if not match:
                 add_message(
                     "assistant",
-                    "Please enter the numeric appointment ID shown on your booking confirmation.",
+                    "Please enter the numeric appointment ID "
+                    "shown on your booking confirmation.",
                 )
             else:
                 flow["appointment_id"] = int(match.group(1))
@@ -679,7 +861,8 @@ if user_text:
 
                 add_message(
                     "assistant",
-                    "Now enter the phone number used when booking the appointment.",
+                    "Now enter the phone number used when "
+                    "booking the appointment.",
                 )
 
         elif stage == "need_phone":
@@ -697,8 +880,9 @@ if user_text:
                 if not result.get("found"):
                     add_message(
                         "assistant",
-                        "I couldn't find an appointment matching those details in your account. "
-                        "Check the booking ID and phone number, then try again. "
+                        "I couldn't find an appointment matching "
+                        "those details in your account. Check the "
+                        "booking ID and phone number, then try again. "
                         "Type CANCEL REQUEST to stop.",
                     )
                 else:
@@ -706,24 +890,33 @@ if user_text:
 
                     if appointment["status"] != "confirmed":
                         st.session_state.cancel_flow = None
+
                         add_message(
                             "assistant",
-                            f"This appointment is already **{appointment['status']}** "
-                            "and cannot be cancelled again.",
+                            f"This appointment is already "
+                            f"**{appointment['status']}** and cannot "
+                            "be cancelled again.",
                         )
                     else:
                         flow["patient_phone"] = patient_phone
                         flow["appointment_details"] = appointment
                         flow["stage"] = "awaiting_confirmation"
 
+                        appointment_date = (
+                            appointment.get("date_display")
+                            or appointment.get("date", "Not provided")
+                        )
+
                         add_message(
                             "assistant",
                             (
                                 "Please review your appointment:\n\n"
-                                f"- **Booking ID:** {appointment['appointment_id']}\n"
-                                f"- **Patient:** {appointment['patient_name']}\n"
+                                f"- **Booking ID:** "
+                                f"{appointment['appointment_id']}\n"
+                                f"- **Patient:** "
+                                f"{appointment['patient_name']}\n"
                                 f"- **Doctor:** {appointment['doctor']}\n"
-                                f"- **Date:** {appointment['date']}\n"
+                                f"- **Date:** {appointment_date}\n"
                                 f"- **Time:** {appointment['time']}\n"
                                 f"- **Status:** {appointment['status']}\n\n"
                                 "To proceed, type **CONFIRM CANCEL**. "
@@ -735,7 +928,8 @@ if user_text:
                 print(f"Appointment lookup error: {error}")
                 add_message(
                     "assistant",
-                    "I couldn't verify that booking right now. Please try again.",
+                    "I couldn't verify that booking right now. "
+                    "Please try again.",
                 )
 
         elif stage == "awaiting_confirmation":
@@ -749,15 +943,21 @@ if user_text:
                         }
                     )
 
-                    if result.get("success"):
+                    if result.get("success") is True:
                         details = flow["appointment_details"]
+                        appointment_date = (
+                            details.get("date_display")
+                            or details.get("date", "Not provided")
+                        )
+
                         add_message(
                             "assistant",
                             (
                                 "✅ **Appointment cancelled successfully.**\n\n"
-                                f"- **Booking ID:** {details['appointment_id']}\n"
+                                f"- **Booking ID:** "
+                                f"{details['appointment_id']}\n"
                                 f"- **Doctor:** {details['doctor']}\n"
-                                f"- **Date:** {details['date']}\n"
+                                f"- **Date:** {appointment_date}\n"
                                 f"- **Time:** {details['time']}\n\n"
                                 "The cancellation has been saved to the database."
                             ),
@@ -775,7 +975,8 @@ if user_text:
                     print(f"Appointment cancellation error: {error}")
                     add_message(
                         "assistant",
-                        "The cancellation could not be completed. Please try again.",
+                        "The cancellation could not be completed. "
+                        "Please try again.",
                     )
 
                 finally:
@@ -789,13 +990,15 @@ if user_text:
                 st.session_state.cancel_flow = None
                 add_message(
                     "assistant",
-                    "Cancellation stopped. Your appointment has not been cancelled.",
+                    "Cancellation stopped. Your appointment "
+                    "has not been cancelled.",
                 )
 
             else:
                 add_message(
                     "assistant",
-                    "Type **CONFIRM CANCEL** to proceed or **NO** to keep your appointment.",
+                    "Type **CONFIRM CANCEL** to proceed or "
+                    "**NO** to keep your appointment.",
                 )
 
         st.stop()
@@ -823,10 +1026,11 @@ if user_text:
 
     if cancellation_intent:
         st.session_state.cancel_flow = {"stage": "need_id"}
+
         add_message(
             "assistant",
-            "I can help cancel an appointment belonging to your account. "
-            "First, enter its numeric booking ID.",
+            "I can help cancel an appointment belonging to "
+            "your account. First, enter its numeric booking ID.",
         )
         st.stop()
 
@@ -838,28 +1042,43 @@ if user_text:
         content="""
 You are MediCare AI, a professional appointment assistant.
 
-Use tools for doctor details, clinic schedules, availability,
-and appointment records. Never invent results.
+GENERAL RULES
+- Use tools for doctor details, clinic schedules, availability,
+  and appointment records.
+- Never invent doctor information, available slots, booking IDs,
+  appointment records, or operation results.
+- Never diagnose conditions or recommend treatment.
+- For emergencies, advise contacting local emergency services.
+- Keep responses friendly, concise, and professional.
 
-Before booking:
-1. Collect the patient's name, phone, doctor, date, time, and optional reason.
-2. Check availability using the database.
+BOOKING RULES
+1. Before booking, collect the patient's name, phone, doctor,
+   date, time, and optional reason.
+2. Check availability using the database before proposing a slot.
 3. Show the proposed details and ask for explicit confirmation.
-4. Only call the booking tool after the patient confirms.
-5. Never claim a booking succeeded unless the tool confirms it.
+4. Only call the booking tool after the patient explicitly confirms
+   the displayed booking details.
+5. Never say an appointment is booked unless the booking tool
+   returns success=true.
+6. If a booking tool returns success=false, clearly explain that
+   the booking was not completed. Never describe it as confirmed.
+7. Never calculate or guess a weekday yourself. Use the exact
+   date_display returned by the tool.
+8. If a requested day is outside the doctor's working schedule,
+   do not attempt to book it. Offer valid dates returned by the tools.
 
-The application injects the authenticated account ID into booking,
-lookup, and cancellation tools. Never ask the user for that ID.
-Never try to override or guess the authenticated account ID.
+AUTHENTICATION AND PRIVACY
+- The application injects the authenticated account ID into
+  booking, lookup, and cancellation tools.
+- Never ask the user for their account ID.
+- Never guess, change, or override the authenticated account ID.
+- Appointment lookup and cancellation must apply only to the
+  currently logged-in account.
+- Cancellation is handled by the application's separate
+  confirmation workflow.
 
-Appointment lookup and cancellation must only apply to the
-currently logged-in account. Cancellation is handled by the
-application's separate confirmation workflow.
-
-Help with scheduling only. Do not diagnose conditions or recommend treatment.
-For emergencies, advise contacting local emergency services.
-
-Keep responses friendly, concise, and professional.
+Do not claim that an operation succeeded unless the relevant
+tool actually confirms success.
 """
     )
 
@@ -867,15 +1086,23 @@ Keep responses friendly, concise, and professional.
 
     for message in st.session_state.messages:
         if message["role"] == "user":
-            history.append(HumanMessage(content=message["content"]))
+            history.append(
+                HumanMessage(content=message["content"])
+            )
         elif message["role"] == "assistant":
-            history.append(AIMessage(content=message["content"]))
+            history.append(
+                AIMessage(content=message["content"])
+            )
 
     try:
         with st.chat_message("assistant"):
             with st.spinner("MediCare AI is thinking..."):
                 response = llm.invoke(history)
 
+                booking_result = None
+                booking_tool_failed = False
+
+                # Run the model's requested tools.
                 for _ in range(5):
                     if not response.tool_calls:
                         break
@@ -883,48 +1110,102 @@ Keep responses friendly, concise, and professional.
                     history.append(response)
 
                     for tool_call in response.tool_calls:
+                        tool_name = tool_call["name"]
+                        is_booking = is_booking_tool(tool_name)
+
                         try:
                             result = execute_tool(
-                                tool_call["name"],
+                                tool_name,
                                 tool_call["args"],
                                 supabase_user_id=supabase_user_id,
                             )
+
+                            if not isinstance(result, dict):
+                                result = {
+                                    "success": False,
+                                    "message": (
+                                        "The tool returned an unexpected "
+                                        "response."
+                                    ),
+                                }
+
                         except Exception as error:
-                            print(f"Tool execution error: {error}")
+                            print(
+                                f"Tool execution error "
+                                f"({tool_name}): {error}"
+                            )
+
                             result = {
                                 "success": False,
-                                "message": "The operation failed. Please try again.",
+                                "message": (
+                                    "The operation failed. "
+                                    "Please check the details and try again."
+                                ),
                             }
+
+                            if is_booking:
+                                booking_tool_failed = True
+
+                        if is_booking:
+                            booking_result = result
 
                         history.append(
                             ToolMessage(
-                                content=json.dumps(result, default=str),
+                                content=json.dumps(
+                                    result,
+                                    default=str,
+                                ),
                                 tool_call_id=tool_call["id"],
                             )
                         )
 
                     response = llm.invoke(history)
 
-                reply = response.content
+                # A real booking-tool result takes priority over
+                # AI-generated wording. This prevents the model from
+                # inventing a weekday or claiming an unsuccessful
+                # booking was successful.
+                if booking_result is not None:
+                    if (
+                        booking_result.get("success") is True
+                        and not booking_tool_failed
+                    ):
+                        reply = format_booking_success(
+                            booking_result
+                        )
+                    else:
+                        reply = format_booking_failure(
+                            booking_result
+                        )
 
-                if isinstance(reply, list):
-                    reply = "\n".join(
-                        item.get("text", "")
-                        for item in reply
-                        if isinstance(item, dict)
-                    )
+                else:
+                    reply = response.content
 
-                if not reply:
-                    reply = "I couldn't complete that request. Please try again."
+                    if isinstance(reply, list):
+                        reply = "\n".join(
+                            item.get("text", "")
+                            for item in reply
+                            if isinstance(item, dict)
+                        )
+
+                    if not isinstance(reply, str) or not reply.strip():
+                        reply = (
+                            "I couldn't complete that request. "
+                            "Please try again."
+                        )
 
                 st.markdown(reply)
 
         st.session_state.messages.append(
-            {"role": "assistant", "content": reply}
+            {
+                "role": "assistant",
+                "content": reply,
+            }
         )
 
     except Exception as error:
         print(f"Groq/chat error: {error}")
+
         error_message = (
             "I'm having trouble connecting to the AI service. "
             "Please check your Groq configuration and try again."
@@ -934,5 +1215,8 @@ Keep responses friendly, concise, and professional.
             st.error(error_message)
 
         st.session_state.messages.append(
-            {"role": "assistant", "content": error_message}
+            {
+                "role": "assistant",
+                "content": error_message,
+            }
         )
