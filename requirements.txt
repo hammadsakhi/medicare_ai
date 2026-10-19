@@ -1,0 +1,10 @@
+
+streamlit
+langchain-core
+langchain-groq
+streamlit-cookies-controller==0.0.4
+sqlalchemy
+psycopg[binary]
+python-dotenv
+bcrypt
+supabase
